@@ -1,0 +1,11 @@
+syntax = "proto2";
+
+package PROTO;
+
+import "person.proto";
+
+message Persons {
+    repeated Person people = 1;
+    required string gourp = 2;
+    required int32 count = 3;
+}
