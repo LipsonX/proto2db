@@ -1,3 +1,10 @@
+# ========================================
+# Created by Lipson on 24-4-1.
+# Email to LipsonChan@yahoo.com
+# Copyright (c) 2024 Lipson. All rights reserved.
+# version 1.0
+# ========================================
+
 macro(add_protolib libname proto_dir proto_out cmdenv protoc)
     message("add_protolib ${libname}")
 
