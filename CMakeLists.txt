@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.0)
-project(protodb)
+project(proto2db)
 
 set(CMAKE_CXX_STANDARD 20)
 
