@@ -8,7 +8,7 @@
 cmake_minimum_required(VERSION 3.0)
 project(proto2db)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 17)
 
 include(protobuild.cmake)
 add_protolib(protos ${CMAKE_CURRENT_SOURCE_DIR}/proto ${CMAKE_CURRENT_SOURCE_DIR}/proto.out "LD_LIBRARY_PATH=." protoc)

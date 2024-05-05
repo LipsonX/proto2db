@@ -1,0 +1,1 @@
+sudo apt-get install protobuf-compiler libprotobuf-dev sqlite3 libsqlite3-dev

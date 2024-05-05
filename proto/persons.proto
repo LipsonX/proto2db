@@ -6,6 +6,6 @@ import "person.proto";
 
 message Persons {
     repeated Person people = 1;
-    required string gourp = 2;
+    required string group_id = 2;
     required int32 count = 3;
 }

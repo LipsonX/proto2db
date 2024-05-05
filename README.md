@@ -1,13 +1,18 @@
-## A helpful C++ tool for writing/reading protobuf to/from db
+## A helpful C++ tool for protobuf
 
 #### require
 - C++17
 - protobuf
 - sqlite3
 
+#### tools
+- cmake tool
+- convertor for `protobuf <-> structure`
+- mapper for `protobuf <-> sqlite db`
+
 for debian:
 ```
-apt install protobuf-compiler libprotobuf-dev sqlite3 libsqlite3-dev
+sudo apt install protobuf-compiler libprotobuf-dev sqlite3 libsqlite3-dev
 ```
 
 #### how to use

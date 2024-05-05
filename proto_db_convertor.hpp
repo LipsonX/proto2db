@@ -9,6 +9,7 @@
 #define PROTODB_PROTO_DB_CONVERTOR_HPP
 
 #include <google/protobuf/descriptor.h>
+#include <google/protobuf/message.h>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -16,6 +17,8 @@
 #include <string>
 #include <unordered_set>
 #include <vector>
+
+namespace proto_mapper {
 
 class SafeSQLite {
 public:
@@ -31,9 +34,10 @@ public:
   sqlite3 *get() const { return db_; }
   std::mutex &mutex() { return mutex_; }
 
-  void excute(const std::string& sql="") {
+  void execute(const std::string &sql = "") {
+    std::unique_lock<std::mutex> lock(mutex_);
     if (!sql.empty()) {
-      sqlite3_exec(db_, sql.c_str(), 0, 0, 0);
+      sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, nullptr);
     }
   }
 
@@ -43,65 +47,88 @@ private:
 };
 
 template <typename T>
-bool DEFAULT_CONVERT(sqlite3_stmt *, int, const std::string &, const T &) {
+bool DEFAULT_SQLITE_BIND(sqlite3_stmt *, int, const std::string &, const T &) {
   return false;
 }
 
-template <typename T, bool ConvF(sqlite3_stmt *, int, const std::string &,
-                                 const T &) = DEFAULT_CONVERT>
+// template <typename T, std::function<bool(sqlite3_stmt *, int, const std::string &, const T &)> ConvF = DEFAULT_CONVERT> template <typename T, typename ConvF>
+template <typename T, bool BindF(sqlite3_stmt *, int, const std::string &,
+                                 const T &) = DEFAULT_SQLITE_BIND>
 class ProtoDBConvertor {
 public:
-  ProtoDBConvertor(const std::shared_ptr<SafeSQLite> db,
-                         const std::unordered_set<std::string> skip_names = {},
-                         bool need_create_table = false)
-      : db_(db) {
+  explicit ProtoDBConvertor(
+      const std::shared_ptr<SafeSQLite> &db,
+      const std::string &primary_key = "",
+      const std::unordered_set<std::string> &skip_names = {},
+      bool need_create_table = false)
+      : db_(db), primary_key_(primary_key) {
+    std::unique_lock<std::mutex> lock(db_->mutex());
+
     const google::protobuf::Descriptor *descriptor = T::descriptor();
-    tableName_ = descriptor->name();
+    table_name_ = descriptor->name();
 
     for (int i = 0; i < descriptor->field_count(); ++i) {
       const auto &field = *descriptor->field(i);
-      std::string fieldName = field.name();
-      if (skip_names.find(fieldName) != skip_names.end()) {
+      std::string field_name = field.name();
+      if (skip_names.find(field_name) != skip_names.end()) {
         continue;
       }
-
-      memberNames_.push_back(fieldName);
+      member_names_.push_back(field_name);
     }
 
     if (need_create_table) {
-      create_table();
+      create_table_();
     }
 
-    std::string insertSql = "INSERT INTO " + tableName_ + " (";
-    for (const auto &fieldName : memberNames_) {
-      insertSql += fieldName + ",";
+    std::string insert_sql;
+    if (primary_key_.empty()) {
+      insert_sql = "INSERT INTO " + table_name_ + " (";
+    } else {
+      insert_sql = "REPLACE INTO " + table_name_ + " (";
     }
-    insertSql.pop_back();
-    insertSql += ") VALUES (";
-    for (size_t i = 0; i < memberNames_.size(); ++i) {
-      insertSql += "?,";
-    }
-    insertSql.pop_back();
-    insertSql += ");";
 
-    std::unique_lock<std::mutex> lock(db_->mutex());
-    if (sqlite3_prepare_v2(db_->get(), insertSql.c_str(), -1, &insert_stmt_,
+    for (const auto &field_name : member_names_) {
+      insert_sql += field_name + ",";
+    }
+    insert_sql.pop_back();
+    insert_sql += ") VALUES (";
+    for (size_t i = 0; i < member_names_.size(); ++i) {
+      insert_sql += "?,";
+    }
+    insert_sql.pop_back();
+    insert_sql += ");";
+
+    if (!primary_key_.empty()) {
+      auto sql = "DELETE FROM " + T::descriptor()->name() + " WHERE " +
+                 primary_key_ + " = ?";
+      if (sqlite3_prepare_v2(db_->get(), sql.c_str(), -1, &delete_stmt_,
+                             nullptr) != SQLITE_OK) {
+        throw std::runtime_error("Failed to prepare statement");
+      }
+    }
+
+    if (sqlite3_prepare_v2(db_->get(), insert_sql.c_str(), -1, &insert_stmt_,
                            nullptr) != SQLITE_OK) {
       throw std::runtime_error("Failed to prepare statement");
     }
   }
 
-  ~ProtoDBConvertor() { sqlite3_finalize(insert_stmt_); }
+  ~ProtoDBConvertor() {
+    sqlite3_finalize(insert_stmt_);
+    sqlite3_finalize(delete_stmt_);
+  }
 
   bool create_table() {
     std::unique_lock<std::mutex> lock(db_->mutex());
+    return create_table_();
+  }
 
-    std::string createTableSql =
-        "CREATE TABLE IF NOT EXISTS " + tableName_ + " (";
-    for (const auto &memberName : memberNames_) {
+  bool create_table_() {
+    std::string create_sql = "CREATE TABLE IF NOT EXISTS " + table_name_ + " (";
+    for (const auto &memberName : member_names_) {
       const auto &field = *T::descriptor()->FindFieldByName(memberName);
-      std::string fieldName = field.name();
-      std::string fieldType;
+      std::string field_name = field.name();
+      std::string field_type;
       switch (field.type()) {
       case google::protobuf::FieldDescriptor::TYPE_INT32:
       case google::protobuf::FieldDescriptor::TYPE_INT64:
@@ -113,30 +140,36 @@ public:
       case google::protobuf::FieldDescriptor::TYPE_FIXED64:
       case google::protobuf::FieldDescriptor::TYPE_SFIXED32:
       case google::protobuf::FieldDescriptor::TYPE_SFIXED64:
-        fieldType = "INTEGER";
+      case google::protobuf::FieldDescriptor::TYPE_ENUM:
+        field_type = "INTEGER";
         break;
       case google::protobuf::FieldDescriptor::TYPE_FLOAT:
       case google::protobuf::FieldDescriptor::TYPE_DOUBLE:
-        fieldType = "REAL";
+        field_type = "REAL";
         break;
       case google::protobuf::FieldDescriptor::TYPE_BOOL:
-        fieldType = "BOOLEAN";
+        field_type = "BOOLEAN";
         break;
       case google::protobuf::FieldDescriptor::TYPE_STRING:
-        fieldType = "TEXT";
+        field_type = "TEXT";
         break;
       default:
-        fieldType = "BLOB";
+        field_type = "BLOB";
         break;
       }
-      createTableSql += fieldName + " " + fieldType + ",";
+      if (primary_key_ == field_name) {
+        create_sql += field_name + " " + field_type +
+                      " PRIMARY KEY NOT NULL ON CONFLICT REPLACE,";
+      } else {
+        create_sql += field_name + " " + field_type + ",";
+      }
     }
-    createTableSql.pop_back();
-    createTableSql += ");";
+    create_sql.pop_back();
+    create_sql += ");";
 
     char *errmsg;
-    if (sqlite3_exec(db_->get(), createTableSql.c_str(), nullptr, nullptr, &errmsg) !=
-        SQLITE_OK) {
+    if (sqlite3_exec(db_->get(), create_sql.c_str(), nullptr, nullptr,
+                     &errmsg) != SQLITE_OK) {
       std::cerr << "Failed to create table: " << errmsg;
       return false;
     }
@@ -156,78 +189,86 @@ public:
     }
   }
 
+  void convert_filed_(sqlite3_stmt *stmt, int index, const std::string &name,
+                      const T &obj) {
+    if (!BindF(stmt, index, name, obj)) {
+      const auto &field = *T::descriptor()->FindFieldByName(name);
+      switch (field.type()) {
+      case google::protobuf::FieldDescriptor::TYPE_INT32:
+        sqlite3_bind_int(stmt, index,
+                         obj.GetReflection()->GetInt32(obj, &field));
+        break;
+      case google::protobuf::FieldDescriptor::TYPE_INT64:
+        sqlite3_bind_int64(stmt, index,
+                           obj.GetReflection()->GetInt64(obj, &field));
+        break;
+      case google::protobuf::FieldDescriptor::TYPE_UINT32:
+        sqlite3_bind_int(stmt, index,
+                         obj.GetReflection()->GetUInt32(obj, &field));
+        break;
+      case google::protobuf::FieldDescriptor::TYPE_UINT64:
+        sqlite3_bind_int64(stmt, index,
+                           obj.GetReflection()->GetUInt64(obj, &field));
+        break;
+      case google::protobuf::FieldDescriptor::TYPE_FIXED32:
+        sqlite3_bind_int(stmt, index,
+                         obj.GetReflection()->GetUInt32(obj, &field));
+        break;
+      case google::protobuf::FieldDescriptor::TYPE_FIXED64:
+        sqlite3_bind_int64(stmt, index,
+                           obj.GetReflection()->GetUInt64(obj, &field));
+        break;
+      case google::protobuf::FieldDescriptor::TYPE_SFIXED32:
+        sqlite3_bind_int(stmt, index,
+                         obj.GetReflection()->GetInt32(obj, &field));
+        break;
+      case google::protobuf::FieldDescriptor::TYPE_SFIXED64:
+        sqlite3_bind_int64(stmt, index,
+                           obj.GetReflection()->GetInt64(obj, &field));
+        break;
+      case google::protobuf::FieldDescriptor::TYPE_FLOAT:
+        sqlite3_bind_double(stmt, index,
+                            obj.GetReflection()->GetFloat(obj, &field));
+        break;
+      case google::protobuf::FieldDescriptor::TYPE_DOUBLE:
+        sqlite3_bind_double(stmt, index,
+                            obj.GetReflection()->GetDouble(obj, &field));
+        break;
+      case google::protobuf::FieldDescriptor::TYPE_BOOL:
+        sqlite3_bind_int(stmt, index,
+                         obj.GetReflection()->GetBool(obj, &field));
+        break;
+      case google::protobuf::FieldDescriptor::TYPE_STRING:
+        sqlite3_bind_text(stmt, index,
+                          obj.GetReflection()->GetString(obj, &field).c_str(),
+                          -1, SQLITE_TRANSIENT);
+        break;
+      default: // handle bytes
+        throw std::runtime_error("Unsupported field type: " + field.name());
+      }
+    }
+  }
+
   void write_(const T &obj) {
     int index = 1;
-    for (const auto &memberName : memberNames_) {
-      const auto &field = *T::descriptor()->FindFieldByName(memberName);
-      if (!ConvF(insert_stmt_, index, field.name(), obj)) {
-        switch (field.type()) {
-        case google::protobuf::FieldDescriptor::TYPE_INT32:
-          sqlite3_bind_int(insert_stmt_, index,
-                           obj.GetReflection()->GetInt32(obj, &field));
-          break;
-        case google::protobuf::FieldDescriptor::TYPE_INT64:
-          sqlite3_bind_int64(insert_stmt_, index,
-                             obj.GetReflection()->GetInt64(obj, &field));
-          break;
-        case google::protobuf::FieldDescriptor::TYPE_UINT32:
-          sqlite3_bind_int(insert_stmt_, index,
-                           obj.GetReflection()->GetUInt32(obj, &field));
-          break;
-        case google::protobuf::FieldDescriptor::TYPE_UINT64:
-          sqlite3_bind_int64(insert_stmt_, index,
-                             obj.GetReflection()->GetUInt64(obj, &field));
-          break;
-        case google::protobuf::FieldDescriptor::TYPE_FIXED32:
-          sqlite3_bind_int(insert_stmt_, index,
-                           obj.GetReflection()->GetUInt32(obj, &field));
-          break;
-        case google::protobuf::FieldDescriptor::TYPE_FIXED64:
-          sqlite3_bind_int64(insert_stmt_, index,
-                             obj.GetReflection()->GetUInt64(obj, &field));
-          break;
-        case google::protobuf::FieldDescriptor::TYPE_SFIXED32:
-          sqlite3_bind_int(insert_stmt_, index,
-                           obj.GetReflection()->GetInt32(obj, &field));
-          break;
-        case google::protobuf::FieldDescriptor::TYPE_SFIXED64:
-          sqlite3_bind_int64(insert_stmt_, index,
-                             obj.GetReflection()->GetInt64(obj, &field));
-          break;
-        case google::protobuf::FieldDescriptor::TYPE_FLOAT:
-          sqlite3_bind_double(insert_stmt_, index,
-                              obj.GetReflection()->GetFloat(obj, &field));
-          break;
-        case google::protobuf::FieldDescriptor::TYPE_DOUBLE:
-          sqlite3_bind_double(insert_stmt_, index,
-                              obj.GetReflection()->GetDouble(obj, &field));
-          break;
-        case google::protobuf::FieldDescriptor::TYPE_BOOL:
-          sqlite3_bind_int(insert_stmt_, index,
-                           obj.GetReflection()->GetBool(obj, &field));
-          break;
-        case google::protobuf::FieldDescriptor::TYPE_STRING:
-          sqlite3_bind_text(insert_stmt_, index,
-                            obj.GetReflection()->GetString(obj, &field).c_str(),
-                            -1, SQLITE_TRANSIENT);
-          break;
-        default: // handle bytes
-          throw std::runtime_error("Unsupported field type: " + field.name());
-        }
-      }
-
+    for (const auto &name : member_names_) {
+      convert_filed_(insert_stmt_, index, name, obj);
       ++index;
     }
     sqlite3_step(insert_stmt_);
     sqlite3_reset(insert_stmt_);
   }
 
-  std::vector<T> read(const std::string& sql="select * from " + std::string(T::descriptor()->name())) {
+  std::vector<T>
+  read(const std::string &sql = "select * from " +
+                                std::string(T::descriptor()->name())) {
     const google::protobuf::Descriptor *descriptor = T::descriptor();
 
     sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(db_->get(), sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
-      throw std::runtime_error("Error querying database: " + std::string(sqlite3_errmsg(db_->get())));
+    if (sqlite3_prepare_v2(db_->get(), sql.c_str(), -1, &stmt, nullptr) !=
+        SQLITE_OK) {
+      throw std::runtime_error("Error querying database: " +
+                               std::string(sqlite3_errmsg(db_->get())));
     }
 
     std::vector<T> result;
@@ -236,7 +277,8 @@ public:
       const google::protobuf::Reflection *reflection = obj.GetReflection();
       for (int i = 0; i < sqlite3_column_count(stmt); ++i) {
         const char *name = sqlite3_column_name(stmt, i);
-        const google::protobuf::FieldDescriptor *field = descriptor->FindFieldByName(name);
+        const google::protobuf::FieldDescriptor *field =
+            descriptor->FindFieldByName(name);
         if (field == nullptr) {
           throw std::runtime_error("Unknown field name: " + std::string(name));
         }
@@ -263,7 +305,9 @@ public:
           reflection->SetBool(&obj, field, sqlite3_column_int(stmt, i) != 0);
           break;
         case google::protobuf::FieldDescriptor::CppType::CPPTYPE_STRING:
-          reflection->SetString(&obj, field, reinterpret_cast<const char *>(sqlite3_column_text(stmt, i)));
+          reflection->SetString(
+              &obj, field,
+              reinterpret_cast<const char *>(sqlite3_column_text(stmt, i)));
           break;
         default:
           throw std::runtime_error("Unsupported field type: " + field->name());
@@ -277,11 +321,24 @@ public:
     return result;
   }
 
+  void delete_obj(const T &obj) {
+    if (primary_key_.empty()) {
+      return;
+    }
+
+    convert_filed_(delete_stmt_, 1, primary_key_, obj);
+    sqlite3_step(delete_stmt_);
+    sqlite3_reset(delete_stmt_);
+  }
+
 private:
-  sqlite3_stmt *insert_stmt_;
-  std::string tableName_;
-  std::vector<std::string> memberNames_;
+  sqlite3_stmt *insert_stmt_ = nullptr;
+  sqlite3_stmt *delete_stmt_ = nullptr;
+  std::string table_name_;
+  std::string primary_key_;
+  std::vector<std::string> member_names_;
   std::shared_ptr<SafeSQLite> db_;
 };
 
+}
 #endif // PROTODB_PROTO_DB_CONVERTOR_HPP
